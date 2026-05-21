@@ -1,8 +1,9 @@
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use teloxide::{prelude::*, types::InputFile};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::process::Command; // <-- Para ejecutar FFmpeg sin bloquear el hilo
 
 const MUSIC_HOST: &str = "10.0.0.5";
 const MUSIC_PORT: u16 = 7878;
@@ -60,7 +61,6 @@ struct MusicResponse {
     message: Option<String>,
 }
 
-// 1. Refactor a asíncrono usando tokio::net::TcpStream
 async fn music_request(req: &MusicRequest) -> anyhow::Result<MusicResponse> {
     let mut stream = TcpStream::connect((MUSIC_HOST, MUSIC_PORT)).await?;
     let mut line = serde_json::to_string(req)?;
@@ -73,19 +73,14 @@ async fn music_request(req: &MusicRequest) -> anyhow::Result<MusicResponse> {
     reader.read_line(&mut response_line).await?;
 
     let raw_json = response_line.trim();
-
-    // 1. Printeamos el JSON crudo en el log para ver qué está fallando
     log::info!("Raw response: {}", raw_json);
 
-    // 2. Mapeamos el error de Serde para incluir el JSON en el crash,
-    // así es más fácil debugear si vuelve a pasar en el futuro.
     let response: MusicResponse = serde_json::from_str(raw_json)
         .map_err(|e| anyhow::anyhow!("Serde error: {} | Raw string: {}", e, raw_json))?;
 
     Ok(response)
 }
 
-// 2. Propagación del async
 async fn resolve_track(query: &str) -> anyhow::Result<TrackResult> {
     let req = MusicRequest {
         action: "resolve".to_string(),
@@ -105,7 +100,6 @@ async fn resolve_track(query: &str) -> anyhow::Result<TrackResult> {
     }
 }
 
-// 3. Propagación del async
 async fn ensure_cached(query: &str) -> anyhow::Result<TrackResult> {
     let track = resolve_track(query).await?;
     if track.state.as_deref() == Some("partial") {
@@ -130,14 +124,10 @@ fn artist_names(artists: &[Artist]) -> String {
 }
 
 async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow::Result<()> {
-    let status_msg = bot
-        .send_message(chat_id, "Resolving track...")
-        .await?;
+    let status_msg = bot.send_message(chat_id, "Resolviendo track...").await?;
 
-    // 4. Await en la llamada a la caché
     match ensure_cached(query).await {
         Ok(track) => {
-            // 5. Traducción de la ruta por el sshfs
             let file_path = match track.file_path {
                 Some(ref p) => p,
                 None => {
@@ -153,56 +143,86 @@ async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow
                 .map(|a| a.name.as_str())
                 .unwrap_or("Unknown");
 
+            let artists_str = artist_names(&track.artists);
+
             let caption = format!(
                 "{}\n{} - {}\n{}",
                 track.title,
-                artist_names(&track.artists),
+                artists_str,
                 album_str,
                 format_duration(track.duration_seconds)
             );
 
-            bot.edit_message_text(chat_id, status_msg.id, "Sending...").await?;
+            // 1. Fase de Conversión
+            bot.edit_message_text(chat_id, status_msg.id, "Procesando audio (FLAC -> OPUS)...").await?;
+            let opus_tmp_path = format!("/tmp/{}.opus", track.id);
 
-            let path = std::path::PathBuf::from(&file_path);
+            let ffmpeg_output = Command::new("ffmpeg")
+                .arg("-y") // Sobrescribir sin preguntar
+                .arg("-i")
+                .arg(file_path)
+                .arg("-c:a")
+                .arg("libopus")
+                .arg("-b:a")
+                .arg("128k")
+                .arg(&opus_tmp_path)
+                .output() // .output() es asíncrono y espera a que el proceso termine
+                .await?;
 
-            match bot
+            if !ffmpeg_output.status.success() {
+                let err_msg = String::from_utf8_lossy(&ffmpeg_output.stderr);
+                log::error!("FFmpeg error: {}", err_msg);
+                bot.edit_message_text(chat_id, status_msg.id, "Error interno: Falló la conversión a Opus.").await?;
+                return Ok(());
+            }
+
+            // 2. Fase de Subida
+            bot.edit_message_text(chat_id, status_msg.id, "Subiendo a Telegram...").await?;
+            let path = std::path::PathBuf::from(&opus_tmp_path);
+
+            let send_result = bot
                 .send_audio(chat_id, InputFile::file(path))
                 .caption(caption)
-                .await
-            {
+                // Inyección estricta de metadatos vía API (Ignora las tags internas del archivo)
+                .title(track.title.clone())
+                .performer(artists_str)
+                .duration(track.duration_seconds as u32)
+                .await;
+
+            // 3. Limpieza: Eliminamos el Opus temporal de la RAM/Disco sin importar si la subida falló o no
+            if let Err(e) = tokio::fs::remove_file(&opus_tmp_path).await {
+                log::warn!("No se pudo eliminar el archivo temporal {}: {}", opus_tmp_path, e);
+            }
+
+            // 4. Resolución final del estado
+            match send_result {
                 Ok(_) => {
                     bot.delete_message(chat_id, status_msg.id).await.ok();
                 }
                 Err(e) => {
-                    bot.edit_message_text(chat_id, status_msg.id, format!("Failed to send file: {e}"))
-                        .await?;
+                    bot.edit_message_text(chat_id, status_msg.id, format!("Failed to send file: {e}")).await?;
                 }
             }
         }
         Err(e) => {
-            bot.edit_message_text(chat_id, status_msg.id, format!("Error: {e}"))
-                .await?;
+            bot.edit_message_text(chat_id, status_msg.id, format!("Error: {e}")).await?;
         }
     }
     Ok(())
 }
-
 
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init();
     log::info!("starting music bot");
 
-    // 1. Creamos un cliente HTTP personalizado con un timeout largo (ej. 5 minutos)
     let custom_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(300))
         .build()
         .expect("Failed to build reqwest client");
 
-    // 2. Le pasamos el token y el cliente a Teloxide
     let token = std::env::var("TELOXIDE_TOKEN").expect("Falta TELOXIDE_TOKEN en .env");
     let bot = Bot::with_client(token, custom_client).auto_send();
-
 
     teloxide::repl(bot, |bot: AutoSend<Bot>, msg: Message| async move {
         let text = match msg.text() {
@@ -240,7 +260,6 @@ async fn main() {
                         return respond(());
                     }
 
-                    // 6. Await en el comando info
                     match resolve_track(&args).await {
                         Ok(track) => {
                             let album_str = track
