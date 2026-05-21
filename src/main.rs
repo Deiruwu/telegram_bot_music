@@ -154,7 +154,7 @@ async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow
             );
 
             // 1. Fase de Conversión
-            bot.edit_message_text(chat_id, status_msg.id, "Procesando audio (FLAC -> OPUS)...").await?;
+            bot.edit_message_text(chat_id, status_msg.id, "Procesando audio...").await?;
             let opus_tmp_path = format!("/tmp/{}.opus", track.id);
 
             let ffmpeg_output = Command::new("ffmpeg")
@@ -176,18 +176,45 @@ async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow
                 return Ok(());
             }
 
+            // 1.5 Fase de Descarga de Carátula
+            bot.edit_message_text(chat_id, status_msg.id, "Obteniendo carátula...").await?;
+
+            let mut thumb_input = None;
+            if let Some(ref thumb_url) = track.thumbnail_url {
+                // Hacemos un GET rápido. Como la imagen es un thumbnail de ~20KB,
+                // bajarla a RAM no afectará el rendimiento de la Pi.
+                match reqwest::get(thumb_url).await {
+                    Ok(resp) => {
+                        if let Ok(img_bytes) = resp.bytes().await {
+                            // Teloxide necesita un nombre de archivo falso para saber la extensión
+                            thumb_input = Some(InputFile::memory(img_bytes).file_name("cover.jpg"));
+                        }
+                    }
+                    Err(e) => log::warn!("Fallo al descargar carátula para {}: {}", track.title, e),
+                }
+            }
+
             // 2. Fase de Subida
             bot.edit_message_text(chat_id, status_msg.id, "Subiendo a Telegram...").await?;
             let path = std::path::PathBuf::from(&opus_tmp_path);
 
-            let send_result = bot
+            // Armamos la petición base
+            let mut req = bot
                 .send_audio(chat_id, InputFile::file(path))
                 .caption(caption)
-                // Inyección estricta de metadatos vía API (Ignora las tags internas del archivo)
                 .title(track.title.clone())
                 .performer(artists_str)
-                .duration(track.duration_seconds as u32)
-                .await;
+                .duration(track.duration_seconds as u32);
+
+            // Inyectamos la carátula si logramos descargarla
+            if let Some(thumb) = thumb_input {
+                // OJO: En Teloxide versiones < 0.12 esto se llama .thumb()
+                // En versiones >= 0.12 se llama .thumbnail(). Usa el que compile en tu entorno.
+                req = req.thumb(thumb);
+            }
+
+            // Disparamos la petición HTTP hacia Telegram
+            let send_result = req.await;
 
             // 3. Limpieza: Eliminamos el Opus temporal de la RAM/Disco sin importar si la subida falló o no
             if let Err(e) = tokio::fs::remove_file(&opus_tmp_path).await {
