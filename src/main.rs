@@ -172,13 +172,13 @@ async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow
         }
     };
 
-    // 3. Conversion solo si es .flac, opus va directo sin tocar
-    let (audio_path, needs_cleanup) = if file_path.ends_with(".flac") {
-        bot.edit_message_text(chat_id, status_msg.id, "Convirtiendo audio...").await?;
-        let tmp = format!("/tmp/{}.opus", track.id);
+    // 3. Preparar audio: limpiar tag ENCODER que causa el bug de voice note
+    bot.edit_message_text(chat_id, status_msg.id, "Preparando audio...").await?;
+    let tmp_path = format!("/tmp/{}.opus", track.id);
 
+    let (audio_path, needs_cleanup) = if file_path.ends_with(".flac") {
         let out = Command::new("ffmpeg")
-            .args(["-y", "-i", file_path, "-c:a", "libopus", "-b:a", "128k", &tmp])
+            .args(["-y", "-i", file_path, "-c:a", "libopus", "-b:a", "128k", &tmp_path])
             .output().await?;
 
         if !out.status.success() {
@@ -186,25 +186,31 @@ async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow
             bot.edit_message_text(chat_id, status_msg.id, "Error: fallo la conversion.").await?;
             return Ok(());
         }
-
-        (tmp, true)
+        (tmp_path, true)
     } else {
-        (file_path.clone(), false)
+        let out = Command::new("ffmpeg")
+            .args([
+                "-y", "-i", file_path,
+                "-c", "copy",
+                "-map_metadata", "-1",
+                "-metadata", &format!("title={}", track.title),
+                "-metadata", &format!("artist={}", artist_names(&track.artists)),
+                "-metadata", &format!("album={}", track.album.as_ref().map(|a| a.name.as_str()).unwrap_or("")),
+                &tmp_path,
+            ])
+            .output().await?;
+
+        if !out.status.success() {
+            log::error!("FFmpeg tag error: {}", String::from_utf8_lossy(&out.stderr));
+            (file_path.clone(), false)
+        } else {
+            (tmp_path, true)
+        }
     };
 
-    // 4. Caratula
-    bot.edit_message_text(chat_id, status_msg.id, "Obteniendo caratula...").await?;
-    let mut thumb_input = None;
-    if let Some(ref url) = track.thumbnail_url {
-        match reqwest::get(url).await {
-            Ok(resp) => {
-                if let Ok(bytes) = resp.bytes().await {
-                    thumb_input = Some(InputFile::memory(bytes).file_name("cover.jpg"));
-                }
-            }
-            Err(e) => log::warn!("Caratula no disponible para {}: {}", track.title, e),
-        }
-    }
+    // 4. Caratula directo desde la URL, sin descargar
+    let thumb_input = track.thumbnail_url.as_ref()
+        .map(|url| InputFile::url(url.parse().unwrap()));
 
     // 5. Subida
     bot.edit_message_text(chat_id, status_msg.id, "Subiendo a Telegram...").await?;
