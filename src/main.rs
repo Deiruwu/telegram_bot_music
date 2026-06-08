@@ -32,15 +32,19 @@ struct Artist {
 
 #[derive(Deserialize, Debug)]
 struct TrackResult {
-    state: Option<String>,
     id: String,
     title: String,
     duration_seconds: u64,
-    #[allow(dead_code)]
     thumbnail_url: Option<String>,
     file_path: Option<String>,
     album: Option<Album>,
     artists: Vec<Artist>,
+    bpm: Option<i32>,
+    camelot_key: Option<String>,
+    #[allow(dead_code)]
+    state: Option<String>,
+    #[allow(dead_code)]
+    added_at: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -87,7 +91,6 @@ async fn resolve_track(query: &str) -> anyhow::Result<TrackResult> {
         query: query.to_string(),
         limit: None,
     };
-
     let resp = music_request(&req).await?;
     if resp.status != "ok" {
         return Err(anyhow::anyhow!(
@@ -106,7 +109,6 @@ async fn download_track(id: &str) -> anyhow::Result<TrackResult> {
         query: id.to_string(),
         limit: None,
     };
-
     let resp = music_request(&req).await?;
     if resp.status != "ok" {
         return Err(anyhow::anyhow!(
@@ -172,55 +174,77 @@ async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow
         }
     };
 
-    // 3. Preparar audio: limpiar tag ENCODER que causa el bug de voice note
+    // 3. Preparar audio: reescribir tags desde la DB + forzar contenedor opus
+    //    Esto resuelve el bug de voice note (sin tags Telegram no sabe que es musica)
+    //    Si es flac, ffmpeg re-encodea al vuelo porque el output es .opus
     bot.edit_message_text(chat_id, status_msg.id, "Preparando audio...").await?;
     let tmp_path = format!("/tmp/{}.opus", track.id);
+    let artists_str = artist_names(&track.artists);
+    let album_str = track.album.as_ref().map(|a| a.name.as_str()).unwrap_or("").to_string();
 
-    let (audio_path, needs_cleanup) = if file_path.ends_with(".flac") {
-        let out = Command::new("ffmpeg")
-            .args(["-y", "-i", file_path, "-c:a", "libopus", "-b:a", "128k", &tmp_path])
-            .output().await?;
+    let mut ffmpeg_args = vec![
+        "-y".to_string(), "-i".to_string(), file_path.clone(),
+        "-c".to_string(), "copy".to_string(),
+    ];
 
-        if !out.status.success() {
-            log::error!("FFmpeg error: {}", String::from_utf8_lossy(&out.stderr));
-            bot.edit_message_text(chat_id, status_msg.id, "Error: fallo la conversion.").await?;
-            return Ok(());
-        }
+    // Si es flac necesita re-encodear
+    if file_path.ends_with(".flac") {
+        ffmpeg_args[3] = "-c:a".to_string();
+        ffmpeg_args[4] = "libopus".to_string();
+        ffmpeg_args.extend(["-b:a".to_string(), "128k".to_string()]);
+    }
+
+    ffmpeg_args.extend([
+        "-map_metadata".to_string(), "-1".to_string(),
+        "-metadata".to_string(), format!("title={}", track.title),
+        "-metadata".to_string(), format!("artist={}", artists_str),
+        "-metadata".to_string(), format!("album={}", album_str),
+        tmp_path.clone(),
+    ]);
+
+    let out = Command::new("ffmpeg")
+        .args(&ffmpeg_args)
+        .output().await?;
+
+    let (audio_path, needs_cleanup) = if out.status.success() {
         (tmp_path, true)
     } else {
-        let out = Command::new("ffmpeg")
-            .args([
-                "-y", "-i", file_path,
-                "-c", "copy",
-                "-map_metadata", "-1",
-                "-metadata", &format!("title={}", track.title),
-                "-metadata", &format!("artist={}", artist_names(&track.artists)),
-                "-metadata", &format!("album={}", track.album.as_ref().map(|a| a.name.as_str()).unwrap_or("")),
-                &tmp_path,
-            ])
-            .output().await?;
-
-        if !out.status.success() {
-            log::error!("FFmpeg tag error: {}", String::from_utf8_lossy(&out.stderr));
-            (file_path.clone(), false)
-        } else {
-            (tmp_path, true)
-        }
+        log::error!("FFmpeg error: {}", String::from_utf8_lossy(&out.stderr));
+        // Fallback: mandar el original aunque salga como voice note
+        (file_path.clone(), false)
     };
 
-    // 4. Caratula directo desde la URL, sin descargar
-    let thumb_input = track.thumbnail_url.as_ref()
-        .map(|url| InputFile::url(url.parse().unwrap()));
+    // 4. Caratula descargada a memoria
+    bot.edit_message_text(chat_id, status_msg.id, "Obteniendo caratula...").await?;
+    let mut thumb_input = None;
+    if let Some(ref url) = track.thumbnail_url {
+        match reqwest::get(url).await {
+            Ok(resp) => {
+                if let Ok(bytes) = resp.bytes().await {
+                    thumb_input = Some(InputFile::memory(bytes).file_name("cover.jpg"));
+                }
+            }
+            Err(e) => log::warn!("Caratula no disponible para {}: {}", track.title, e),
+        }
+    }
 
-    // 5. Subida
+    // 5. Subida con todos los metadatos
     bot.edit_message_text(chat_id, status_msg.id, "Subiendo a Telegram...").await?;
 
-    let album_str = track.album.as_ref().map(|a| a.name.as_str()).unwrap_or("Unknown");
-    let artists_str = artist_names(&track.artists);
+    let bpm_key = match (&track.bpm, &track.camelot_key) {
+        (Some(b), Some(k)) => format!("\nBPM: {b}  Key: {k}"),
+        (Some(b), None)    => format!("\nBPM: {b}"),
+        (None, Some(k))    => format!("\nKey: {k}"),
+        (None, None)       => String::new(),
+    };
+
     let caption = format!(
-        "{}\n{} — {}\n{}",
-        track.title, artists_str, album_str,
-        format_duration(track.duration_seconds)
+        "{}\n{} — {}\n{}{}",
+        track.title,
+        artists_str,
+        album_str,
+        format_duration(track.duration_seconds),
+        bpm_key,
     );
 
     let mut req = bot
@@ -297,13 +321,19 @@ async fn main() {
                     match resolve_track(&args).await {
                         Ok(track) => {
                             let album_str = track.album.as_ref().map(|a| a.name.as_str()).unwrap_or("Unknown");
+                            let bpm_key = match (&track.bpm, &track.camelot_key) {
+                                (Some(b), Some(k)) => format!("\nBPM: {b}  Key: {k}"),
+                                (Some(b), None)    => format!("\nBPM: {b}"),
+                                (None, Some(k))    => format!("\nKey: {k}"),
+                                (None, None)       => String::new(),
+                            };
                             let info = format!(
-                                "Titulo: {}\nArtista: {}\nAlbum: {}\nDuracion: {}\nEstado: {:?}",
+                                "Titulo: {}\nArtista: {}\nAlbum: {}\nDuracion: {}{}",
                                 track.title,
                                 artist_names(&track.artists),
                                 album_str,
                                 format_duration(track.duration_seconds),
-                                track.state,
+                                bpm_key,
                             );
                             bot.send_message(msg.chat.id, info).await?;
                         }
