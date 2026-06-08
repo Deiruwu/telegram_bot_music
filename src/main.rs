@@ -3,7 +3,7 @@ use std::time::Duration;
 use teloxide::{prelude::*, types::InputFile};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::process::Command; // <-- Para ejecutar FFmpeg sin bloquear el hilo
+use tokio::process::Command;
 
 const MUSIC_HOST: &str = "10.0.0.5";
 const MUSIC_PORT: u16 = 7878;
@@ -100,13 +100,23 @@ async fn resolve_track(query: &str) -> anyhow::Result<TrackResult> {
     }
 }
 
-async fn ensure_cached(query: &str) -> anyhow::Result<TrackResult> {
-    let track = resolve_track(query).await?;
-    if track.state.as_deref() == Some("partial") {
-        let track2 = resolve_track(&track.id).await?;
-        return Ok(track2);
+async fn download_track(id: &str) -> anyhow::Result<TrackResult> {
+    let req = MusicRequest {
+        action: "download".to_string(),
+        query: id.to_string(),
+        limit: None,
+    };
+
+    let resp = music_request(&req).await?;
+    if resp.status != "ok" {
+        return Err(anyhow::anyhow!(
+            resp.message.unwrap_or_else(|| "unknown error".to_string())
+        ));
     }
-    Ok(track)
+    match resp.data {
+        Some(MusicData::Single(track)) => Ok(track),
+        _ => Err(anyhow::anyhow!("unexpected response shape")),
+    }
 }
 
 fn format_duration(seconds: u64) -> String {
@@ -126,115 +136,109 @@ fn artist_names(artists: &[Artist]) -> String {
 async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow::Result<()> {
     let status_msg = bot.send_message(chat_id, "Resolviendo track...").await?;
 
-    match ensure_cached(query).await {
-        Ok(track) => {
-            let file_path = match track.file_path {
-                Some(ref p) => p,
-                None => {
-                    bot.edit_message_text(chat_id, status_msg.id, "Track could not be downloaded.")
-                        .await?;
-                    return Ok(());
-                }
-            };
-
-            let album_str = track
-                .album
-                .as_ref()
-                .map(|a| a.name.as_str())
-                .unwrap_or("Unknown");
-
-            let artists_str = artist_names(&track.artists);
-
-            let caption = format!(
-                "{}\n{} - {}\n{}",
-                track.title,
-                artists_str,
-                album_str,
-                format_duration(track.duration_seconds)
-            );
-
-            // 1. Fase de Conversión
-            bot.edit_message_text(chat_id, status_msg.id, "Procesando audio...").await?;
-            let opus_tmp_path = format!("/tmp/{}.opus", track.id);
-
-            let ffmpeg_output = Command::new("ffmpeg")
-                .arg("-y") // Sobrescribir sin preguntar
-                .arg("-i")
-                .arg(file_path)
-                .arg("-c:a")
-                .arg("libopus")
-                .arg("-b:a")
-                .arg("128k")
-                .arg(&opus_tmp_path)
-                .output() // .output() es asíncrono y espera a que el proceso termine
-                .await?;
-
-            if !ffmpeg_output.status.success() {
-                let err_msg = String::from_utf8_lossy(&ffmpeg_output.stderr);
-                log::error!("FFmpeg error: {}", err_msg);
-                bot.edit_message_text(chat_id, status_msg.id, "Error interno: Falló la conversión a Opus.").await?;
-                return Ok(());
-            }
-
-            // 1.5 Fase de Descarga de Carátula
-            bot.edit_message_text(chat_id, status_msg.id, "Obteniendo carátula...").await?;
-
-            let mut thumb_input = None;
-            if let Some(ref thumb_url) = track.thumbnail_url {
-                // Hacemos un GET rápido. Como la imagen es un thumbnail de ~20KB,
-                // bajarla a RAM no afectará el rendimiento de la Pi.
-                match reqwest::get(thumb_url).await {
-                    Ok(resp) => {
-                        if let Ok(img_bytes) = resp.bytes().await {
-                            // Teloxide necesita un nombre de archivo falso para saber la extensión
-                            thumb_input = Some(InputFile::memory(img_bytes).file_name("cover.jpg"));
-                        }
-                    }
-                    Err(e) => log::warn!("Fallo al descargar carátula para {}: {}", track.title, e),
-                }
-            }
-
-            // 2. Fase de Subida
-            bot.edit_message_text(chat_id, status_msg.id, "Subiendo a Telegram...").await?;
-            let path = std::path::PathBuf::from(&opus_tmp_path);
-
-            // Armamos la petición base
-            let mut req = bot
-                .send_audio(chat_id, InputFile::file(path))
-                .caption(caption)
-                .title(track.title.clone())
-                .performer(artists_str)
-                .duration(track.duration_seconds as u32);
-
-            // Inyectamos la carátula si logramos descargarla
-            if let Some(thumb) = thumb_input {
-                // OJO: En Teloxide versiones < 0.12 esto se llama .thumb()
-                // En versiones >= 0.12 se llama .thumbnail(). Usa el que compile en tu entorno.
-                req = req.thumb(thumb);
-            }
-
-            // Disparamos la petición HTTP hacia Telegram
-            let send_result = req.await;
-
-            // 3. Limpieza: Eliminamos el Opus temporal de la RAM/Disco sin importar si la subida falló o no
-            if let Err(e) = tokio::fs::remove_file(&opus_tmp_path).await {
-                log::warn!("No se pudo eliminar el archivo temporal {}: {}", opus_tmp_path, e);
-            }
-
-            // 4. Resolución final del estado
-            match send_result {
-                Ok(_) => {
-                    bot.delete_message(chat_id, status_msg.id).await.ok();
-                }
-                Err(e) => {
-                    bot.edit_message_text(chat_id, status_msg.id, format!("Failed to send file: {e}")).await?;
-                }
-            }
-        }
+    // 1. Resolve para metadata
+    let track = match resolve_track(query).await {
+        Ok(t) => t,
         Err(e) => {
             bot.edit_message_text(chat_id, status_msg.id, format!("Error: {e}")).await?;
+            return Ok(());
+        }
+    };
+
+    // 2. Download si no tiene file_path
+    let track = if track.file_path.is_none() {
+        bot.edit_message_text(
+            chat_id,
+            status_msg.id,
+            format!("Descargando: {}...", track.title),
+        ).await?;
+
+        match download_track(&track.id).await {
+            Ok(t) => t,
+            Err(e) => {
+                bot.edit_message_text(chat_id, status_msg.id, format!("Error al descargar: {e}")).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        track
+    };
+
+    let file_path = match track.file_path.as_ref() {
+        Some(p) => p,
+        None => {
+            bot.edit_message_text(chat_id, status_msg.id, "No se pudo obtener el archivo.").await?;
+            return Ok(());
+        }
+    };
+
+    // 3. Conversion solo si es .flac, opus va directo sin tocar
+    let (audio_path, needs_cleanup) = if file_path.ends_with(".flac") {
+        bot.edit_message_text(chat_id, status_msg.id, "Convirtiendo audio...").await?;
+        let tmp = format!("/tmp/{}.opus", track.id);
+
+        let out = Command::new("ffmpeg")
+            .args(["-y", "-i", file_path, "-c:a", "libopus", "-b:a", "128k", &tmp])
+            .output().await?;
+
+        if !out.status.success() {
+            log::error!("FFmpeg error: {}", String::from_utf8_lossy(&out.stderr));
+            bot.edit_message_text(chat_id, status_msg.id, "Error: fallo la conversion.").await?;
+            return Ok(());
+        }
+
+        (tmp, true)
+    } else {
+        (file_path.clone(), false)
+    };
+
+    // 4. Caratula
+    bot.edit_message_text(chat_id, status_msg.id, "Obteniendo caratula...").await?;
+    let mut thumb_input = None;
+    if let Some(ref url) = track.thumbnail_url {
+        match reqwest::get(url).await {
+            Ok(resp) => {
+                if let Ok(bytes) = resp.bytes().await {
+                    thumb_input = Some(InputFile::memory(bytes).file_name("cover.jpg"));
+                }
+            }
+            Err(e) => log::warn!("Caratula no disponible para {}: {}", track.title, e),
         }
     }
+
+    // 5. Subida
+    bot.edit_message_text(chat_id, status_msg.id, "Subiendo a Telegram...").await?;
+
+    let album_str = track.album.as_ref().map(|a| a.name.as_str()).unwrap_or("Unknown");
+    let artists_str = artist_names(&track.artists);
+    let caption = format!(
+        "{}\n{} — {}\n{}",
+        track.title, artists_str, album_str,
+        format_duration(track.duration_seconds)
+    );
+
+    let mut req = bot
+        .send_audio(chat_id, InputFile::file(std::path::PathBuf::from(&audio_path)))
+        .caption(caption)
+        .title(track.title.clone())
+        .performer(artists_str)
+        .duration(track.duration_seconds as u32);
+
+    if let Some(thumb) = thumb_input {
+        req = req.thumb(thumb);
+    }
+
+    let result = req.await;
+
+    if needs_cleanup {
+        tokio::fs::remove_file(&audio_path).await.ok();
+    }
+
+    match result {
+        Ok(_) => { bot.delete_message(chat_id, status_msg.id).await.ok(); }
+        Err(e) => { bot.edit_message_text(chat_id, status_msg.id, format!("Error al enviar: {e}")).await?; }
+    }
+
     Ok(())
 }
 
@@ -266,15 +270,13 @@ async fn main() {
                 "/start" | "/help" => {
                     bot.send_message(
                         msg.chat.id,
-                        "Commands:\n/play <name or YouTube ID> - send a track\n/info <name or YouTube ID> - show info without downloading\n\nOr just type a song name directly.",
-                    )
-                        .await?;
+                        "Comandos:\n/play <nombre o ID de YouTube> - enviar un track\n/info <nombre o ID de YouTube> - ver info sin descargar\n\nO escribe el nombre de una cancion directamente.",
+                    ).await?;
                 }
 
                 "/play" => {
                     if args.is_empty() {
-                        bot.send_message(msg.chat.id, "Usage: /play <song name or YouTube ID>")
-                            .await?;
+                        bot.send_message(msg.chat.id, "Uso: /play <nombre o ID de YouTube>").await?;
                         return respond(());
                     }
                     send_track(&bot, msg.chat.id, &args).await.ok();
@@ -282,20 +284,15 @@ async fn main() {
 
                 "/info" => {
                     if args.is_empty() {
-                        bot.send_message(msg.chat.id, "Usage: /info <song name or YouTube ID>")
-                            .await?;
+                        bot.send_message(msg.chat.id, "Uso: /info <nombre o ID de YouTube>").await?;
                         return respond(());
                     }
 
                     match resolve_track(&args).await {
                         Ok(track) => {
-                            let album_str = track
-                                .album
-                                .as_ref()
-                                .map(|a| a.name.as_str())
-                                .unwrap_or("Unknown");
+                            let album_str = track.album.as_ref().map(|a| a.name.as_str()).unwrap_or("Unknown");
                             let info = format!(
-                                "Title: {}\nArtist: {}\nAlbum: {}\nDuration: {}\nState: {:?}",
+                                "Titulo: {}\nArtista: {}\nAlbum: {}\nDuracion: {}\nEstado: {:?}",
                                 track.title,
                                 artist_names(&track.artists),
                                 album_str,
@@ -311,8 +308,7 @@ async fn main() {
                 }
 
                 _ => {
-                    bot.send_message(msg.chat.id, "Unknown command. Use /help.")
-                        .await?;
+                    bot.send_message(msg.chat.id, "Comando desconocido. Usa /help.").await?;
                 }
             }
         } else {
@@ -320,6 +316,5 @@ async fn main() {
         }
 
         respond(())
-    })
-        .await;
+    }).await;
 }
