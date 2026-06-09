@@ -174,61 +174,98 @@ async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow
         }
     };
 
-    // 3. Preparar audio: reescribir tags desde la DB + forzar contenedor opus
-    //    Esto resuelve el bug de voice note (sin tags Telegram no sabe que es musica)
-    //    Si es flac, ffmpeg re-encodea al vuelo porque el output es .opus
-    bot.edit_message_text(chat_id, status_msg.id, "Preparando audio...").await?;
-    let tmp_path = format!("/tmp/{}.opus", track.id);
     let artists_str = artist_names(&track.artists);
     let album_str = track.album.as_ref().map(|a| a.name.as_str()).unwrap_or("").to_string();
 
-    let mut ffmpeg_args = vec![
-        "-y".to_string(), "-i".to_string(), file_path.clone(),
-        "-c".to_string(), "copy".to_string(),
-    ];
-
-    // Si es flac necesita re-encodear
-    if file_path.ends_with(".flac") {
-        ffmpeg_args[3] = "-c:a".to_string();
-        ffmpeg_args[4] = "libopus".to_string();
-        ffmpeg_args.extend(["-b:a".to_string(), "128k".to_string()]);
-    }
-
-    ffmpeg_args.extend([
-        "-map_metadata".to_string(), "-1".to_string(),
-        "-metadata".to_string(), format!("title={}", track.title),
-        "-metadata".to_string(), format!("artist={}", artists_str),
-        "-metadata".to_string(), format!("album={}", album_str),
-        tmp_path.clone(),
-    ]);
-
-    let out = Command::new("ffmpeg")
-        .args(&ffmpeg_args)
-        .output().await?;
-
-    let (audio_path, needs_cleanup) = if out.status.success() {
-        (tmp_path, true)
-    } else {
-        log::error!("FFmpeg error: {}", String::from_utf8_lossy(&out.stderr));
-        // Fallback: mandar el original aunque salga como voice note
-        (file_path.clone(), false)
-    };
-
-    // 4. Caratula descargada a memoria
+    // 3. Descargar caratula a /tmp (un solo download, dos usos)
     bot.edit_message_text(chat_id, status_msg.id, "Obteniendo caratula...").await?;
+    let cover_path = format!("/tmp/{}_cover.jpg", track.id);
     let mut thumb_input = None;
+
     if let Some(ref url) = track.thumbnail_url {
         match reqwest::get(url).await {
             Ok(resp) => {
                 if let Ok(bytes) = resp.bytes().await {
-                    thumb_input = Some(InputFile::memory(bytes).file_name("cover.jpg"));
+                    log::info!("Caratula descargada: {} bytes", bytes.len());
+                    if tokio::fs::write(&cover_path, &bytes).await.is_ok() {
+                        thumb_input = Some(InputFile::memory(bytes).file_name("cover.jpg"));
+                    }
                 }
             }
             Err(e) => log::warn!("Caratula no disponible para {}: {}", track.title, e),
         }
     }
 
-    // 5. Subida con todos los metadatos
+    // 4. Preparar audio con ffmpeg:
+    //    - Incrustar caratula como cover art
+    //    - Reescribir tags desde la DB
+    //    - Re-encodear solo si es flac, de lo contrario -c copy
+    bot.edit_message_text(chat_id, status_msg.id, "Preparando audio...").await?;
+    let tmp_path = format!("/tmp/{}.opus", track.id);
+    let has_cover = thumb_input.is_some();
+
+    let out = if has_cover {
+        let mut args = vec![
+            "-y".to_string(),
+            "-i".to_string(), file_path.clone(),
+            "-i".to_string(), cover_path.clone(),
+            "-map".to_string(), "0:a".to_string(),
+            "-map".to_string(), "1:v".to_string(),
+        ];
+
+        if file_path.ends_with(".flac") {
+            args.extend(["-c:a".to_string(), "libopus".to_string(), "-b:a".to_string(), "128k".to_string()]);
+        } else {
+            args.extend(["-c:a".to_string(), "copy".to_string()]);
+        }
+
+        args.extend([
+            "-c:v".to_string(), "copy".to_string(),
+            "-map_metadata".to_string(), "-1".to_string(),
+            "-metadata".to_string(), format!("title={}", track.title),
+            "-metadata".to_string(), format!("artist={}", artists_str),
+            "-metadata".to_string(), format!("album={}", album_str),
+            "-metadata:s:v".to_string(), "title=Album cover".to_string(),
+            "-metadata:s:v".to_string(), "comment=Cover (front)".to_string(),
+            tmp_path.clone(),
+        ]);
+
+        Command::new("ffmpeg").args(&args).output().await?
+    } else {
+        // Sin caratula, solo tags
+        let mut args = vec![
+            "-y".to_string(),
+            "-i".to_string(), file_path.clone(),
+        ];
+
+        if file_path.ends_with(".flac") {
+            args.extend(["-c:a".to_string(), "libopus".to_string(), "-b:a".to_string(), "128k".to_string()]);
+        } else {
+            args.extend(["-c".to_string(), "copy".to_string()]);
+        }
+
+        args.extend([
+            "-map_metadata".to_string(), "-1".to_string(),
+            "-metadata".to_string(), format!("title={}", track.title),
+            "-metadata".to_string(), format!("artist={}", artists_str),
+            "-metadata".to_string(), format!("album={}", album_str),
+            tmp_path.clone(),
+        ]);
+
+        Command::new("ffmpeg").args(&args).output().await?
+    };
+
+    // Limpiar cover temporal
+    tokio::fs::remove_file(&cover_path).await.ok();
+
+    let (audio_path, needs_cleanup) = if out.status.success() {
+        (tmp_path, true)
+    } else {
+        log::error!("FFmpeg error: {}", String::from_utf8_lossy(&out.stderr));
+        (file_path.clone(), false)
+    };
+
+    // 5. Subida
     bot.edit_message_text(chat_id, status_msg.id, "Subiendo a Telegram...").await?;
 
     let bpm_key = match (&track.bpm, &track.camelot_key) {
@@ -240,9 +277,7 @@ async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow
 
     let caption = format!(
         "{}\n{} — {}\n{}{}",
-        track.title,
-        artists_str,
-        album_str,
+        track.title, artists_str, album_str,
         format_duration(track.duration_seconds),
         bpm_key,
     );
