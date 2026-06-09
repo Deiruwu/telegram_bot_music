@@ -177,86 +177,44 @@ async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow
     let artists_str = artist_names(&track.artists);
     let album_str = track.album.as_ref().map(|a| a.name.as_str()).unwrap_or("").to_string();
 
-    // 3. Descargar caratula a /tmp (un solo download, dos usos)
+    // 3. Caratula a memoria para el .thumb()
     bot.edit_message_text(chat_id, status_msg.id, "Obteniendo caratula...").await?;
-    let cover_path = format!("/tmp/{}_cover.jpg", track.id);
     let mut thumb_input = None;
-
     if let Some(ref url) = track.thumbnail_url {
         match reqwest::get(url).await {
             Ok(resp) => {
                 if let Ok(bytes) = resp.bytes().await {
                     log::info!("Caratula descargada: {} bytes", bytes.len());
-                    if tokio::fs::write(&cover_path, &bytes).await.is_ok() {
-                        thumb_input = Some(InputFile::memory(bytes).file_name("cover.jpg"));
-                    }
+                    thumb_input = Some(InputFile::memory(bytes).file_name("cover.jpg"));
                 }
             }
             Err(e) => log::warn!("Caratula no disponible para {}: {}", track.title, e),
         }
     }
 
-    // 4. Preparar audio con ffmpeg:
-    //    - Incrustar caratula como cover art
-    //    - Reescribir tags desde la DB
-    //    - Re-encodear solo si es flac, de lo contrario -c copy
     bot.edit_message_text(chat_id, status_msg.id, "Preparando audio...").await?;
     let tmp_path = format!("/tmp/{}.opus", track.id);
-    let has_cover = thumb_input.is_some();
 
-    let out = if has_cover {
-        let mut args = vec![
-            "-y".to_string(),
-            "-i".to_string(), file_path.clone(),
-            "-i".to_string(), cover_path.clone(),
-            "-map".to_string(), "0:a".to_string(),
-            "-map".to_string(), "1:v".to_string(),
-        ];
+    let mut args = vec![
+        "-y".to_string(),
+        "-i".to_string(), file_path.clone(),
+    ];
 
-        if file_path.ends_with(".flac") {
-            args.extend(["-c:a".to_string(), "libopus".to_string(), "-b:a".to_string(), "128k".to_string()]);
-        } else {
-            args.extend(["-c:a".to_string(), "copy".to_string()]);
-        }
-
-        args.extend([
-            "-c:v".to_string(), "copy".to_string(),
-            "-map_metadata".to_string(), "-1".to_string(),
-            "-metadata".to_string(), format!("title={}", track.title),
-            "-metadata".to_string(), format!("artist={}", artists_str),
-            "-metadata".to_string(), format!("album={}", album_str),
-            "-metadata:s:v".to_string(), "title=Album cover".to_string(),
-            "-metadata:s:v".to_string(), "comment=Cover (front)".to_string(),
-            tmp_path.clone(),
-        ]);
-
-        Command::new("ffmpeg").args(&args).output().await?
+    if file_path.ends_with(".flac") {
+        args.extend(["-c:a".to_string(), "libopus".to_string(), "-b:a".to_string(), "128k".to_string()]);
     } else {
-        // Sin caratula, solo tags
-        let mut args = vec![
-            "-y".to_string(),
-            "-i".to_string(), file_path.clone(),
-        ];
+        args.extend(["-c".to_string(), "copy".to_string()]);
+    }
 
-        if file_path.ends_with(".flac") {
-            args.extend(["-c:a".to_string(), "libopus".to_string(), "-b:a".to_string(), "128k".to_string()]);
-        } else {
-            args.extend(["-c".to_string(), "copy".to_string()]);
-        }
+    args.extend([
+        "-map_metadata".to_string(), "-1".to_string(),
+        "-metadata".to_string(), format!("title={}", track.title),
+        "-metadata".to_string(), format!("artist={}", artists_str),
+        "-metadata".to_string(), format!("album={}", album_str),
+        tmp_path.clone(),
+    ]);
 
-        args.extend([
-            "-map_metadata".to_string(), "-1".to_string(),
-            "-metadata".to_string(), format!("title={}", track.title),
-            "-metadata".to_string(), format!("artist={}", artists_str),
-            "-metadata".to_string(), format!("album={}", album_str),
-            tmp_path.clone(),
-        ]);
-
-        Command::new("ffmpeg").args(&args).output().await?
-    };
-
-    // Limpiar cover temporal
-    tokio::fs::remove_file(&cover_path).await.ok();
+    let out = Command::new("ffmpeg").args(&args).output().await?;
 
     let (audio_path, needs_cleanup) = if out.status.success() {
         (tmp_path, true)
