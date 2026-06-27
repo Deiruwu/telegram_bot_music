@@ -180,7 +180,7 @@ async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow
     // 3. Caratula a memoria para el .thumb()
     bot.edit_message_text(chat_id, status_msg.id, "Obteniendo caratula...").await?;
     let mut thumb_input = None;
-    if let Some(ref url) = track.thumbnail_url {
+    if let Some(ref url) = track.thumbnail_small {
         match reqwest::get(url).await {
             Ok(resp) => {
                 if let Ok(bytes) = resp.bytes().await {
