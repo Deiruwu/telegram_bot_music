@@ -35,7 +35,7 @@ struct TrackResult {
     id: String,
     title: String,
     duration_seconds: u64,
-    thumbnail_url: Option<String>,
+    thumbnail_small: Option<String>,
     file_path: Option<String>,
     album: Option<Album>,
     artists: Vec<Artist>,
@@ -192,6 +192,8 @@ async fn send_track(bot: &AutoSend<Bot>, chat_id: ChatId, query: &str) -> anyhow
         }
     }
 
+    // 4. ffmpeg: tags desde la DB + fix contenedor
+    //    Re-encodea solo si es flac, de lo contrario -c copy
     bot.edit_message_text(chat_id, status_msg.id, "Preparando audio...").await?;
     let tmp_path = format!("/tmp/{}.opus", track.id);
 
